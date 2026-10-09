@@ -314,19 +314,22 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// Spec.Replicas is the count the listener asked for when it published
 		// Spec.PatchID. Deleting finished runners here changes the live count that
 		// the count was computed against, so satisfying it in the same pass would
-		// create runners to replace jobs that have already completed. Record the
-		// patch ID the cleanup belongs to and return, leaving the scaling decision
-		// to the next reconcile, which sees the post-cleanup state.
+		// create runners to replace jobs that have already completed, unless the
+		// listener has explicitly accounted for every completion in this spec.
+		// Record unaccounted cleanup against this patch and return, leaving the
+		// scaling decision to the next reconcile with the post-cleanup state.
 		if len(ephemeralRunnersByState.finished) > 0 {
-			if err := r.patchFinishedRunnerCleanupPatchIDStatus(ctx, req.NamespacedName, ephemeralRunnerSet.Spec.PatchID); err != nil {
-				log.Error(err, "failed to update finished runner cleanup patch ID status")
-				return ctrl.Result{}, err
+			if !finishedRunnersAccountedFor(&ephemeralRunnerSet, ephemeralRunnersByState.finished) {
+				if err := r.patchFinishedRunnerCleanupPatchIDStatus(ctx, req.NamespacedName, ephemeralRunnerSet.Spec.PatchID); err != nil {
+					log.Error(err, "failed to update finished runner cleanup patch ID status")
+					return ctrl.Result{}, err
+				}
+				ephemeralRunnerSet.Status.FinishedRunnerCleanupPatchID = ephemeralRunnerSet.Spec.PatchID
 			}
 			if err := r.deleteTerminatedEphemeralRunners(ctx, ephemeralRunnersByState.finished, log); err != nil {
 				log.Error(err, "failed to delete terminated ephemeral runners")
 				return ctrl.Result{}, err
 			}
-			ephemeralRunnerSet.Status.FinishedRunnerCleanupPatchID = ephemeralRunnerSet.Spec.PatchID
 
 			log.Info("Finished ephemeral runners were cleaned up, deferring scaling decision")
 			return ctrl.Result{}, r.updateStatus(ctx, &ephemeralRunnerSet, ephemeralRunnersByState, log)
@@ -551,6 +554,23 @@ func (r *EphemeralRunnerSetReconciler) patchAppliedActionableRevisionStatus(ctx 
 		// snapshot has to be the one taken before the first mutation above.
 		return r.Status().Patch(ctx, &ephemeralRunnerSet, runnerSet.MergeFrom(client.MergeFromWithOptimisticLock{}))
 	})
+}
+
+// finishedRunnersAccountedFor reports whether the listener's desired count
+// already excludes every job whose runner is being cleaned up. The names and
+// count come from the same spec snapshot; using a newer acknowledgement with an
+// older count could incorrectly bypass the stale-demand guard.
+func finishedRunnersAccountedFor(set *v1alpha1.EphemeralRunnerSet, finished []*v1alpha1.EphemeralRunner) bool {
+	completed := make(map[string]struct{}, len(set.Spec.CompletedRunnerNames))
+	for _, name := range set.Spec.CompletedRunnerNames {
+		completed[name] = struct{}{}
+	}
+	for _, runner := range finished {
+		if _, ok := completed[runner.Name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // scaleUpServicedByFinishedRunnerCleanup reports whether the shortfall against

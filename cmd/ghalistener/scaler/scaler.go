@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/scaleset"
@@ -41,10 +42,11 @@ const (
 // The Scaler's role is to process the messages it receives from the listener.
 // It then initiates Kubernetes API requests to carry out the necessary actions.
 type Scaler struct {
-	clientset     *kubernetes.Clientset
-	config        Config
-	targetRunners int
-	patchSeq      int
+	clientset            *kubernetes.Clientset
+	config               Config
+	completedRunnerNames []string
+	targetRunners        int
+	patchSeq             int
 	// dirty is set when there are any events handled before the desired count is called.
 	dirty  bool
 	logger *slog.Logger
@@ -196,6 +198,15 @@ func (w *Scaler) patchJobStarted(ctx context.Context, jobInfo *scaleset.JobStart
 
 func (w *Scaler) HandleJobCompleted(ctx context.Context, msg *scaleset.JobCompleted) error {
 	w.dirty = true
+	if msg.RunnerName != "" && w.config.MaxRunners > 0 && !slices.Contains(w.completedRunnerNames, msg.RunnerName) {
+		// Keep recent completions across publications: runner termination can lag
+		// the completion event. Bound the history by the pool size; eviction only
+		// loses the optimization and falls back to the existing stale-demand guard.
+		if len(w.completedRunnerNames) >= w.config.MaxRunners {
+			w.completedRunnerNames = append(w.completedRunnerNames[:0], w.completedRunnerNames[1:]...)
+		}
+		w.completedRunnerNames = append(w.completedRunnerNames, msg.RunnerName)
+	}
 	return nil
 }
 
@@ -214,6 +225,8 @@ func (w *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			Spec: v1alpha1.EphemeralRunnerSetSpec{
 				Replicas: -1,
 				PatchID:  -1,
+				// Force an empty history to clear acknowledgements from an earlier listener.
+				CompletedRunnerNames: []string{""},
 			},
 		},
 	)
@@ -224,8 +237,9 @@ func (w *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	patch, err := json.Marshal(
 		&v1alpha1.EphemeralRunnerSet{
 			Spec: v1alpha1.EphemeralRunnerSetSpec{
-				Replicas: w.targetRunners,
-				PatchID:  patchID,
+				Replicas:             w.targetRunners,
+				PatchID:              patchID,
+				CompletedRunnerNames: w.completedRunnerNames,
 			},
 		},
 	)

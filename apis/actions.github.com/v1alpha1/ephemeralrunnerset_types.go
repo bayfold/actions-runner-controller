@@ -28,6 +28,13 @@ type EphemeralRunnerSetSpec struct {
 	// PatchID is the unique identifier for the patch issued by the listener app
 	// +optional
 	PatchID int `json:"patchID"`
+	// CompletedRunnerNames contains recent job completions already accounted for by
+	// Replicas. It is published atomically with Replicas and PatchID so cleanup can
+	// distinguish stale demand from demand that already excludes a finished job.
+	// Missing names conservatively retain the cleanup scale-up guard.
+	// +optional
+	// +listType=set
+	CompletedRunnerNames []string `json:"completedRunnerNames,omitempty"`
 	// EphemeralRunnerSpec is the spec of the ephemeral runner
 	// +optional
 	EphemeralRunnerSpec EphemeralRunnerSpec `json:"ephemeralRunnerSpec,omitempty"`

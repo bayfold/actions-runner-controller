@@ -191,3 +191,25 @@ func TestPatchFinishedRunnerCleanupPatchIDStatusIsIdempotent(t *testing.T) {
 
 	assert.False(t, patched, "recording a patch ID the marker already holds must not emit a write")
 }
+
+func TestFinishedRunnersAccountedFor(t *testing.T) {
+	runners := []*v1alpha1.EphemeralRunner{
+		{ObjectMeta: metav1.ObjectMeta{Name: "runner-a"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "runner-b"}},
+	}
+	for _, tc := range []struct {
+		name      string
+		completed []string
+		want      bool
+	}{
+		{"old listener without acknowledgements", nil, false},
+		{"mixed accounted and unaccounted cleanup", []string{"runner-a"}, false},
+		{"all completions accounted for", []string{"runner-b", "runner-a"}, true},
+		{"unrelated completions do not acknowledge this batch", []string{"runner-c"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := &v1alpha1.EphemeralRunnerSet{Spec: v1alpha1.EphemeralRunnerSetSpec{CompletedRunnerNames: tc.completed}}
+			assert.Equal(t, tc.want, finishedRunnersAccountedFor(set, runners))
+		})
+	}
+}

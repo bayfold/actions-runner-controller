@@ -1119,6 +1119,56 @@ var _ = Describe("Test EphemeralRunnerSet controller", func() {
 			).Should(BeNil(), "2 EphemeralRunner should be created and none should be in Succeeded phase")
 		})
 
+		It("Should replenish accounted completions without another listener patch", func() {
+			key := client.ObjectKeyFromObject(ephemeralRunnerSet)
+			ers := new(v1alpha1.EphemeralRunnerSet)
+			Expect(k8sClient.Get(ctx, key, ers)).To(Succeed())
+			updated := ers.DeepCopy()
+			updated.Spec.Replicas = 2
+			updated.Spec.PatchID = 1
+			Expect(k8sClient.Patch(ctx, updated, client.MergeFrom(ers))).To(Succeed())
+
+			runners := new(v1alpha1.EphemeralRunnerList)
+			Eventually(func() int {
+				Expect(listEphemeralRunnersAndRemoveFinalizers(ctx, k8sClient, runners, ers.Namespace)).To(Succeed())
+				return len(runners.Items)
+			}, ephemeralRunnerSetTestTimeout, ephemeralRunnerSetTestInterval).Should(Equal(2))
+			finished := runners.Items[0].DeepCopy()
+
+			// The listener receives completion and publishes remaining demand
+			// before the runner controller observes pod termination. The count is
+			// unchanged because another job is waiting behind the completed job.
+			Expect(k8sClient.Get(ctx, key, ers)).To(Succeed())
+			updated = ers.DeepCopy()
+			updated.Spec.PatchID = 2
+			updated.Spec.CompletedRunnerNames = []string{finished.Name}
+			Expect(k8sClient.Patch(ctx, updated, client.MergeFrom(ers))).To(Succeed())
+			Eventually(func() int {
+				var observed v1alpha1.EphemeralRunnerSet
+				Expect(k8sClient.Get(ctx, key, &observed)).To(Succeed())
+				return observed.Spec.PatchID
+			}, ephemeralRunnerSetTestTimeout, ephemeralRunnerSetTestInterval).Should(Equal(2))
+
+			original := finished.DeepCopy()
+			finished.Status.Phase = v1alpha1.EphemeralRunnerPhaseSucceeded
+			Expect(k8sClient.Status().Patch(ctx, finished, client.MergeFrom(original))).To(Succeed())
+			Eventually(func() bool {
+				Expect(listEphemeralRunnersAndRemoveFinalizers(ctx, k8sClient, runners, ers.Namespace)).To(Succeed())
+				if len(runners.Items) != 2 {
+					return false
+				}
+				for _, runner := range runners.Items {
+					if runner.Name == finished.Name {
+						return false
+					}
+				}
+				return true
+			}, ephemeralRunnerSetTestTimeout, ephemeralRunnerSetTestInterval).Should(BeTrue(), "replacement must not require the next long-poll publication")
+			Expect(k8sClient.Get(ctx, key, ers)).To(Succeed())
+			Expect(ers.Spec.PatchID).To(Equal(2))
+			Expect(ers.Status.FinishedRunnerCleanupPatchID).NotTo(Equal(2))
+		})
+
 		It("Should not create a replacement when a runner finishes ahead of the listener decrement patch", func() {
 			ers := new(v1alpha1.EphemeralRunnerSet)
 			err := k8sClient.Get(ctx, client.ObjectKey{Name: ephemeralRunnerSet.Name, Namespace: ephemeralRunnerSet.Namespace}, ers)
