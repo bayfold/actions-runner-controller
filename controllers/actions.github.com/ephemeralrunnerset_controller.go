@@ -36,6 +36,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -310,23 +311,35 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	total := ephemeralRunnersByState.scaleTotal()
 	var requeueAfter time.Duration
-	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnersByState.latestPatchID {
+	// A listener snapshot with completion acknowledgements can initially be
+	// satisfied by a runner whose status has not caught up to its completion.
+	// Other runners created from that snapshot carry its patch ID, so gating
+	// solely on latestPatchID would strand the slot when that runner disappears.
+	// Revisit a shortfall against the same acknowledged snapshot; the cleanup
+	// marker below still suppresses demand that excludes an unaccounted finish,
+	// and deleting registrations continue to count toward the scale-up total.
+	acknowledgedShortfall := len(ephemeralRunnerSet.Spec.CompletedRunnerNames) > 0 &&
+		total+len(ephemeralRunnersByState.deleting) < ephemeralRunnerSet.Spec.Replicas
+	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnersByState.latestPatchID || acknowledgedShortfall {
 		// Spec.Replicas is the count the listener asked for when it published
 		// Spec.PatchID. Deleting finished runners here changes the live count that
 		// the count was computed against, so satisfying it in the same pass would
-		// create runners to replace jobs that have already completed. Record the
-		// patch ID the cleanup belongs to and return, leaving the scaling decision
-		// to the next reconcile, which sees the post-cleanup state.
+		// create runners to replace jobs that have already completed, unless the
+		// listener has explicitly accounted for every completion in this spec.
+		// Record unaccounted cleanup against this patch and return, leaving the
+		// scaling decision to the next reconcile with the post-cleanup state.
 		if len(ephemeralRunnersByState.finished) > 0 {
-			if err := r.patchFinishedRunnerCleanupPatchIDStatus(ctx, req.NamespacedName, ephemeralRunnerSet.Spec.PatchID); err != nil {
-				log.Error(err, "failed to update finished runner cleanup patch ID status")
-				return ctrl.Result{}, err
+			if !finishedRunnersAccountedFor(&ephemeralRunnerSet, ephemeralRunnersByState.finished) {
+				if err := r.patchFinishedRunnerCleanupPatchIDStatus(ctx, req.NamespacedName, ephemeralRunnerSet.Spec.PatchID); err != nil {
+					log.Error(err, "failed to update finished runner cleanup patch ID status")
+					return ctrl.Result{}, err
+				}
+				ephemeralRunnerSet.Status.FinishedRunnerCleanupPatchID = ephemeralRunnerSet.Spec.PatchID
 			}
 			if err := r.deleteTerminatedEphemeralRunners(ctx, ephemeralRunnersByState.finished, log); err != nil {
 				log.Error(err, "failed to delete terminated ephemeral runners")
 				return ctrl.Result{}, err
 			}
-			ephemeralRunnerSet.Status.FinishedRunnerCleanupPatchID = ephemeralRunnerSet.Spec.PatchID
 
 			log.Info("Finished ephemeral runners were cleaned up, deferring scaling decision")
 			return ctrl.Result{}, r.updateStatus(ctx, &ephemeralRunnerSet, ephemeralRunnersByState, log)
@@ -353,7 +366,16 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 				return ctrl.Result{}, r.updateStatus(ctx, &ephemeralRunnerSet, ephemeralRunnersByState, log)
 			}
 
-			count := ephemeralRunnerSet.Spec.Replicas - scaleUpTotal
+			// Same-patch replenishment can reconcile again before the informer
+			// observes our previous creates. Confirm capacity against the API
+			// server, including children still being cleaned up, before creating.
+			count, err := r.authoritativeScaleUpCount(ctx, &ephemeralRunnerSet)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if count == 0 {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			log.Info("Creating new ephemeral runners (scale up)", "count", count)
 			if err := r.createEphemeralRunners(ctx, &ephemeralRunnerSet, count, log); err != nil {
 				log.Error(err, "failed to make ephemeral runner")
@@ -553,6 +575,23 @@ func (r *EphemeralRunnerSetReconciler) patchAppliedActionableRevisionStatus(ctx 
 	})
 }
 
+// finishedRunnersAccountedFor reports whether the listener's desired count
+// already excludes every job whose runner is being cleaned up. The names and
+// count come from the same spec snapshot; using a newer acknowledgement with an
+// older count could incorrectly bypass the stale-demand guard.
+func finishedRunnersAccountedFor(set *v1alpha1.EphemeralRunnerSet, finished []*v1alpha1.EphemeralRunner) bool {
+	completed := make(map[string]struct{}, len(set.Spec.CompletedRunnerNames))
+	for _, name := range set.Spec.CompletedRunnerNames {
+		completed[name] = struct{}{}
+	}
+	for _, runner := range finished {
+		if _, ok := completed[runner.Name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // scaleUpServicedByFinishedRunnerCleanup reports whether the shortfall against
 // Spec.Replicas was created by this controller cleaning up finished runners for
 // the patch ID currently in the spec, rather than by new demand from the
@@ -599,6 +638,69 @@ func (r *EphemeralRunnerSetReconciler) scaleUpServicedByFinishedRunnerCleanup(ct
 	}
 
 	return latest.Status.FinishedRunnerCleanupPatchID == ephemeralRunnerSet.Spec.PatchID, nil
+}
+
+// authoritativeScaleUpCount prevents replaying creates while the informer is
+// behind the API server. Reconciles for one set are serialized, so a fresh list
+// includes every successful create from its previous reconcile. Count all owned
+// registrations, even terminal/deleting ones, until cleanup removes them.
+func (r *EphemeralRunnerSetReconciler) authoritativeScaleUpCount(ctx context.Context, set *v1alpha1.EphemeralRunnerSet) (int, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	var runners v1alpha1.EphemeralRunnerList
+	// resourceOwnerKey is a cache-only index; filter API results by owner UID.
+	if err := reader.List(ctx, &runners, client.InNamespace(set.Namespace)); err != nil {
+		return 0, err
+	}
+	// Read the suppression marker after the list. An unacknowledged deletion
+	// records it before removing the child; if the list excludes that child,
+	// this read must see the marker. Reversing the reads would reopen the race.
+	var latest v1alpha1.EphemeralRunnerSet
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(set), &latest); err != nil {
+		return 0, err
+	}
+	if latest.UID != set.UID || latest.Generation != set.Generation ||
+		latest.Spec.PatchID != set.Spec.PatchID || latest.Spec.Replicas != set.Spec.Replicas ||
+		!latest.DeletionTimestamp.IsZero() || latest.Status.Phase == v1alpha1.EphemeralRunnerSetPhaseOutdated ||
+		latest.Status.FinishedRunnerCleanupPatchID == set.Spec.PatchID && set.Spec.PatchID != 0 {
+		return 0, nil
+	}
+	count := 0
+	for i := range runners.Items {
+		owner := metav1.GetControllerOf(&runners.Items[i])
+		if owner != nil && owner.UID == set.UID && owner.Name == set.Name &&
+			owner.Kind == "EphemeralRunnerSet" && owner.APIVersion == v1alpha1.GroupVersion.String() {
+			count++
+		}
+	}
+	return max(0, latest.Spec.Replicas-count), nil
+}
+
+// recordUnaccountedRunnerDeletion protects the same desired-count snapshot when
+// the runner controller deletes a successful runner before the set controller
+// observes its terminal phase. Otherwise an older acknowledgement in that
+// snapshot could permit replaying demand for this unaccounted completion.
+func (r *EphemeralRunnerSetReconciler) recordUnaccountedRunnerDeletion(ctx context.Context, key types.NamespacedName, ownerUID types.UID, runnerName string) error {
+	if r.APIReader == nil {
+		return errors.New("APIReader is not configured, cannot record unaccounted runner deletion")
+	}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest v1alpha1.EphemeralRunnerSet
+		if err := r.APIReader.Get(ctx, key, &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if latest.UID != ownerUID || latest.Spec.PatchID == 0 || slices.Contains(latest.Spec.CompletedRunnerNames, runnerName) {
+			return nil
+		}
+		if latest.Status.FinishedRunnerCleanupPatchID == latest.Spec.PatchID {
+			return nil
+		}
+		original := latest.DeepCopy()
+		latest.Status.FinishedRunnerCleanupPatchID = latest.Spec.PatchID
+		return r.Status().Patch(ctx, &latest, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 // patchFinishedRunnerCleanupPatchIDStatus records that finished runners were

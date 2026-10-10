@@ -54,6 +54,16 @@ spec:
                     Unset defaults to 0.
                   format: int64
                   type: integer
+                completedRunnerNames:
+                  description: |-
+                    CompletedRunnerNames contains recent job completions already accounted for by
+                    Replicas. It is published atomically with Replicas and PatchID so cleanup can
+                    distinguish stale demand from demand that already excludes a finished job.
+                    Missing names conservatively retain the cleanup scale-up guard.
+                  items:
+                    type: string
+                  type: array
+                  x-kubernetes-list-type: set
                 ephemeralRunnerMetadata:
                   description: |-
                     EphemeralRunnerMetadata is the metadata to be applied to all ephemeral runners created by this set.
