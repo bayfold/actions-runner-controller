@@ -310,7 +310,16 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	total := ephemeralRunnersByState.scaleTotal()
 	var requeueAfter time.Duration
-	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnersByState.latestPatchID {
+	// A listener snapshot with completion acknowledgements can initially be
+	// satisfied by a runner whose status has not caught up to its completion.
+	// Other runners created from that snapshot carry its patch ID, so gating
+	// solely on latestPatchID would strand the slot when that runner disappears.
+	// Revisit a shortfall against the same acknowledged snapshot; the cleanup
+	// marker below still suppresses demand that excludes an unaccounted finish,
+	// and deleting registrations continue to count toward the scale-up total.
+	acknowledgedShortfall := len(ephemeralRunnerSet.Spec.CompletedRunnerNames) > 0 &&
+		total+len(ephemeralRunnersByState.deleting) < ephemeralRunnerSet.Spec.Replicas
+	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnersByState.latestPatchID || acknowledgedShortfall {
 		// Spec.Replicas is the count the listener asked for when it published
 		// Spec.PatchID. Deleting finished runners here changes the live count that
 		// the count was computed against, so satisfying it in the same pass would
@@ -619,6 +628,31 @@ func (r *EphemeralRunnerSetReconciler) scaleUpServicedByFinishedRunnerCleanup(ct
 	}
 
 	return latest.Status.FinishedRunnerCleanupPatchID == ephemeralRunnerSet.Spec.PatchID, nil
+}
+
+// recordUnaccountedRunnerDeletion protects the same desired-count snapshot when
+// the runner controller deletes a successful runner before the set controller
+// observes its terminal phase. Otherwise an older acknowledgement in that
+// snapshot could permit replaying demand for this unaccounted completion.
+func (r *EphemeralRunnerSetReconciler) recordUnaccountedRunnerDeletion(ctx context.Context, key types.NamespacedName, ownerUID types.UID, runnerName string) error {
+	if r.APIReader == nil {
+		return errors.New("APIReader is not configured, cannot record unaccounted runner deletion")
+	}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest v1alpha1.EphemeralRunnerSet
+		if err := r.APIReader.Get(ctx, key, &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if latest.UID != ownerUID || latest.Spec.PatchID == 0 || slices.Contains(latest.Spec.CompletedRunnerNames, runnerName) {
+			return nil
+		}
+		if latest.Status.FinishedRunnerCleanupPatchID == latest.Spec.PatchID {
+			return nil
+		}
+		original := latest.DeepCopy()
+		latest.Status.FinishedRunnerCleanupPatchID = latest.Spec.PatchID
+		return r.Status().Patch(ctx, &latest, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 // patchFinishedRunnerCleanupPatchIDStatus records that finished runners were

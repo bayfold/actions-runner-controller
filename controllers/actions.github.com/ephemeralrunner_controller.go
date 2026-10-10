@@ -523,6 +523,16 @@ func (r *EphemeralRunnerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, r.deleteEphemeralRunnerOrPod(ctx, &ephemeralRunner, pod, log)
 
 	default: // succeeded
+		// The set may never observe Succeeded before this controller deletes the
+		// runner. Preserve its stale-demand guard before either transition, using
+		// an uncached, optimistic-lock-protected listener snapshot.
+		if owner := metav1.GetControllerOf(&ephemeralRunner); owner != nil && owner.Kind == "EphemeralRunnerSet" && owner.APIVersion == v1alpha1.GroupVersion.String() {
+			setController := EphemeralRunnerSetReconciler{Client: r.Client, APIReader: r.APIReader}
+			key := types.NamespacedName{Namespace: ephemeralRunner.Namespace, Name: owner.Name}
+			if err := setController.recordUnaccountedRunnerDeletion(ctx, key, owner.UID, ephemeralRunner.Name); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to guard unaccounted runner completion: %w", err)
+			}
+		}
 		log.Info("Ephemeral runner has finished successfully, deleting ephemeral runner", "exitCode", cs.State.Terminated.ExitCode)
 		if err := r.markAsSucceeded(ctx, &ephemeralRunner, pod, log); err != nil {
 			log.Error(err, "Failed to set ephemeral runner to phase Succeeded")
