@@ -36,6 +36,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -365,7 +366,16 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 				return ctrl.Result{}, r.updateStatus(ctx, &ephemeralRunnerSet, ephemeralRunnersByState, log)
 			}
 
-			count := ephemeralRunnerSet.Spec.Replicas - scaleUpTotal
+			// Same-patch replenishment can reconcile again before the informer
+			// observes our previous creates. Confirm capacity against the API
+			// server, including children still being cleaned up, before creating.
+			count, err := r.authoritativeScaleUpCount(ctx, &ephemeralRunnerSet)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if count == 0 {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			log.Info("Creating new ephemeral runners (scale up)", "count", count)
 			if err := r.createEphemeralRunners(ctx, &ephemeralRunnerSet, count, log); err != nil {
 				log.Error(err, "failed to make ephemeral runner")
@@ -628,6 +638,44 @@ func (r *EphemeralRunnerSetReconciler) scaleUpServicedByFinishedRunnerCleanup(ct
 	}
 
 	return latest.Status.FinishedRunnerCleanupPatchID == ephemeralRunnerSet.Spec.PatchID, nil
+}
+
+// authoritativeScaleUpCount prevents replaying creates while the informer is
+// behind the API server. Reconciles for one set are serialized, so a fresh list
+// includes every successful create from its previous reconcile. Count all owned
+// registrations, even terminal/deleting ones, until cleanup removes them.
+func (r *EphemeralRunnerSetReconciler) authoritativeScaleUpCount(ctx context.Context, set *v1alpha1.EphemeralRunnerSet) (int, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	var runners v1alpha1.EphemeralRunnerList
+	// resourceOwnerKey is a cache-only index; filter API results by owner UID.
+	if err := reader.List(ctx, &runners, client.InNamespace(set.Namespace)); err != nil {
+		return 0, err
+	}
+	// Read the suppression marker after the list. An unacknowledged deletion
+	// records it before removing the child; if the list excludes that child,
+	// this read must see the marker. Reversing the reads would reopen the race.
+	var latest v1alpha1.EphemeralRunnerSet
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(set), &latest); err != nil {
+		return 0, err
+	}
+	if latest.UID != set.UID || latest.Generation != set.Generation ||
+		latest.Spec.PatchID != set.Spec.PatchID || latest.Spec.Replicas != set.Spec.Replicas ||
+		!latest.DeletionTimestamp.IsZero() || latest.Status.Phase == v1alpha1.EphemeralRunnerSetPhaseOutdated ||
+		latest.Status.FinishedRunnerCleanupPatchID == set.Spec.PatchID && set.Spec.PatchID != 0 {
+		return 0, nil
+	}
+	count := 0
+	for i := range runners.Items {
+		owner := metav1.GetControllerOf(&runners.Items[i])
+		if owner != nil && owner.UID == set.UID && owner.Name == set.Name &&
+			owner.Kind == "EphemeralRunnerSet" && owner.APIVersion == v1alpha1.GroupVersion.String() {
+			count++
+		}
+	}
+	return max(0, latest.Spec.Replicas-count), nil
 }
 
 // recordUnaccountedRunnerDeletion protects the same desired-count snapshot when

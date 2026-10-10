@@ -1,6 +1,7 @@
 package actionsgithubcom
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // Reproduces the observed handover: the listener already accounted for seed's
@@ -102,4 +104,62 @@ func TestSamePatchCompletionReplenishment(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The cache keeps showing one missing runner even after a previous reconcile
+// created it. Repeated reconciles must count the authoritative child list.
+func TestSamePatchReplenishmentWithStaleChildCache(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, v1alpha1.AddToScheme(scheme))
+	set := &v1alpha1.EphemeralRunnerSet{ObjectMeta: metav1.ObjectMeta{Name: "handover", Namespace: "test-ns", UID: "handover", Finalizers: []string{EphemeralRunnerSetFinalizerName}}, Spec: v1alpha1.EphemeralRunnerSetSpec{Replicas: 3, PatchID: 5, CompletedRunnerNames: []string{"finished"}, EphemeralRunnerSpec: v1alpha1.EphemeralRunnerSpec{PodTemplateSpec: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "runner", Image: "runner:latest"}}}}}}}
+	objects := []client.Object{set}
+	controller := true
+	for i := 0; i < 2; i++ {
+		objects = append(objects, &v1alpha1.EphemeralRunner{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("cached-%d", i), Namespace: set.Namespace, Annotations: map[string]string{AnnotationKeyPatchID: "5"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "EphemeralRunnerSet", Name: set.Name, UID: set.UID, Controller: &controller}}}, Status: v1alpha1.EphemeralRunnerStatus{Phase: v1alpha1.EphemeralRunnerPhaseRunning}})
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&v1alpha1.EphemeralRunnerSet{}).WithIndex(&v1alpha1.EphemeralRunner{}, resourceOwnerKey, newGroupVersionOwnerKindIndexer("EphemeralRunnerSet")).Build()
+	cached := interceptor.NewClient(c, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if err := c.List(ctx, list, opts...); err != nil {
+			return err
+		}
+		if runners, ok := list.(*v1alpha1.EphemeralRunnerList); ok {
+			filtered := runners.Items[:0]
+			for _, runner := range runners.Items {
+				if runner.Name == "cached-0" || runner.Name == "cached-1" {
+					filtered = append(filtered, runner)
+				}
+			}
+			runners.Items = filtered
+		}
+		return nil
+	}})
+	r := EphemeralRunnerSetReconciler{Client: cached, APIReader: c, Log: logr.Discard(), Scheme: scheme, ResourceBuilder: ResourceBuilder{Scheme: scheme, ResourceCache: newTestResourceCache()}}
+	for i := 0; i < 3; i++ {
+		_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(set)})
+		require.NoError(t, err)
+		var runners v1alpha1.EphemeralRunnerList
+		require.NoError(t, c.List(t.Context(), &runners, client.InNamespace(set.Namespace)))
+		require.Len(t, runners.Items, 3, "a stale cache must not replay successful creates")
+	}
+}
+
+func TestScaleUpCountObservesCleanupAfterChildList(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1alpha1.AddToScheme(scheme))
+	set := &v1alpha1.EphemeralRunnerSet{ObjectMeta: metav1.ObjectMeta{Name: "handover", Namespace: "test-ns", UID: "handover"}, Spec: v1alpha1.EphemeralRunnerSetSpec{Replicas: 3, PatchID: 5, CompletedRunnerNames: []string{"earlier-job"}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(set).WithStatusSubresource(&v1alpha1.EphemeralRunnerSet{}).Build()
+	reader := interceptor.NewClient(c, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if err := c.List(ctx, list, opts...); err != nil {
+			return err
+		}
+		var latest v1alpha1.EphemeralRunnerSet
+		require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(set), &latest))
+		latest.Status.FinishedRunnerCleanupPatchID = 5
+		return c.Status().Update(ctx, &latest)
+	}})
+	r := EphemeralRunnerSetReconciler{Client: c, APIReader: reader}
+	count, err := r.authoritativeScaleUpCount(t.Context(), set)
+	require.NoError(t, err)
+	require.Zero(t, count, "cleanup committed before the child list returns must suppress replacement")
 }
