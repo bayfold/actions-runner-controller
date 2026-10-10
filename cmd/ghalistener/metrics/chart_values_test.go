@@ -53,6 +53,7 @@ func TestChartValuesMetricsExample(t *testing.T) {
 	allLabels := map[string][]string{
 		MetricStartedJobsTotal:            startedLabels,
 		MetricCompletedJobsTotal:          completedLabels,
+		MetricJobQueueDurationSeconds:     startedLabels,
 		MetricJobStartupDurationSeconds:   startedLabels,
 		MetricJobExecutionDurationSeconds: completedLabels,
 	}

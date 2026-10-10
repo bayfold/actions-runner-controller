@@ -567,3 +567,26 @@ func TestRecordJobCompleted(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueDurationTimestamps(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name            string
+		queue, assigned time.Time
+		count           uint64
+		sum             float64
+	}{
+		{"valid", now, now.Add(1500 * time.Millisecond), 1, 1.5},
+		{"missing queue", time.Time{}, now, 0, 0},
+		{"missing assignment", now, time.Time{}, 0, 0},
+		{"reversed", now, now.Add(-time.Second), 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, reg := newTestExporter(t, v1alpha1.MetricsConfig{Histograms: map[string]*v1alpha1.HistogramMetric{MetricJobQueueDurationSeconds: {Labels: []string{labelKeyRepository, labelKeyJobName}}}})
+			e.RecordJobStarted(&scaleset.JobStarted{JobMessageBase: scaleset.JobMessageBase{OwnerName: "org", RepositoryName: "repo", JobDisplayName: "build", QueueTime: tc.queue, ScaleSetAssignTime: tc.assigned, RunnerAssignTime: now.Add(2 * time.Second)}})
+			metrics := gatherMetrics(t, reg)
+			assert.Equal(t, tc.count, histogramSampleCount(t, metrics, MetricJobQueueDurationSeconds))
+			assert.Equal(t, tc.sum, histogramSampleSum(t, metrics, MetricJobQueueDurationSeconds))
+		})
+	}
+}
